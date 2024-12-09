@@ -1,0 +1,141 @@
+
+!apt install bcftools
+!apt install bwa
+!apt install samtools
+
+###### CRISPR sample
+
+!gdown 1-96T1PZKA_FQeD_ZK5z9USaHLP3jVdRO
+!gdown 1-BXGr3XVGtd9Tx6PCHSp4hepK41GGCTS
+
+### To make thinngs faster for the student, here is the indexed mouse genome, mm10.
+### You have to donwload it and decompressed it, you will get both the fasta and the BWT'ed files. Note all have same prefix Mouse<.files>.
+### Next semester we will cover how specialized computers are often used to solve this aligmnet problems faster.
+
+!gdown 1a8CP4P5zkzIBiw1EleqJiSwDW0VZcAar
+
+## Tar is allowing us to store multiple files under the folder MM10.
+## We will use this files to align the reads from our sample to our refernce genome
+!tar -xzvf MM10.tar.gz MM10
+
+## We're using samtools program and faidx command to prepare the FASTA index file from the FATSA file downloaded in the previous cell
+## We will be narrowing our search to chr 2 to make downloading a bit quicker so we are renaming our file to chr2.fasta
+!samtools faidx MM10/Mouse.fasta chr2 > chr2.fasta
+
+## indexing allows BWA to quickly locate regions in the genome that are similar to the query reads
+## Since we gave it thr chr.fasta file, it will be creating index files for that reference file
+!bwa index chr2.fasta
+
+## The !bwa mem command is using the Burrows-Wheeler Aligner to align paired-end reads (CRISPR.R1.fastq and CRISPR.R2.fastq) to the reference genome (chr2.fasta).
+## We will use this to see how many mutations there are against the reference genome
+!bwa mem chr2.fasta CRISPR.R1.fastq CRISPR.R2.fastq > aligned_reads_chr2.sam
+
+## We are converting our SAM file into a BAM file to save more space as it is compressed version and it will also process faster when we use tools downstream
+## We then sort our bam file by genomic positions to make them compatible with tools we will use downstream and rename it the file so that we know they have been aligned
+!samtools view -Sb aligned_reads_chr2.sam > aligned_reads_chr2.bam
+!samtools sort aligned_reads_chr2.bam -o sorted_reads_chr2.bam
+
+#indexing the sorted file will read the sorted BAM file and analyze its structure and alignment position
+## This will enable faster access to alignments in soecific genomic regions
+## Creating this indexed file will allow for variant calling in subsequent steps
+!samtools index sorted_reads_chr2.bam
+
+## Generates a pileup of sequencing data from the aligned reads in the BAM file
+## -Ou Outputs the pileup data in an uncompressed binary BCF format to standard output, which we will pipe
+## -f specifies the refernce genome, chr2
+## We then use bcftools call to call genetic variants from the mpileup data, output is a VCF file thst contains the information about the variants
+!bcftools mpileup -Ou -f chr2.fasta sorted_reads_chr2.bam | bcftools call -mv -Oz -o variants_chr2.vcf.gz
+
+#improving the accuracy by removing low-quality reads
+## 'QUAL>20' keeps only variants with a QUAL greater than 20, which indicates higher confidence in the variant call
+## 'DP>10' keeps only variants with a DP greater than 10, which ensures sufficient sequencing coverage supports the variant call
+## Our output is a compressed VCF file
+!bcftools filter -i 'QUAL>20 && DP>10' variants_chr2.vcf.gz -Oz -o filtered_variants_chr2.vcf.gz
+
+!pip install cyvcf2
+
+## Converting our compressed VCF file into an uncompressed VCF file
+!bcftools view variants_chr2.vcf.gz -Ov > filtered_variants_chr2.vcf
+
+## Using cyvcf2 will allow the script to iterate through each variant in the VCF file
+## We are converting the VCF file into a TSV file so we can use pandas to analyze and visualize the data
+## We name our dataframe as df so we can use it downstream
+
+import cyvcf2
+import pandas as pd
+
+vcf_path = 'filtered_variants_chr2.vcf'
+
+# Convert VCF to TSV
+with open('output.tsv', 'w') as file:
+    for variant in cyvcf2.VCF(vcf_path):
+      genotype = variant.gt_types[0]
+      data_string = f"{variant.CHROM}\t{variant.POS}\t{variant.ID}\t{variant.REF}\t{','.join(variant.ALT)}\t{variant.QUAL}\t{variant.FILTER}\t{genotype}\n"
+      file.write(data_string)
+
+# Load TSV into DataFrame
+columns = ['CHROM', 'POS', 'ID', 'REF', 'ALT', 'QUAL', 'FILTER', 'GENOTYPE']
+df = pd.read_csv("output.tsv", delimiter="\t", header=None, names=columns)
+df
+
+## First, we are converting the 'QUAL' to numeric for proper filtering
+## 'QUAL'>60 filters the DataFrame to retain only high-quality variants
+
+df['QUAL'] = pd.to_numeric(df['QUAL'], errors='coerce')
+
+filtered_df = df[df['QUAL'] > 60]
+filtered_df
+
+# Identifying intended mutations, we have given it a list of where we expect to find specific mutations
+## Using isin and the specified column 'POS' , we're making sure each value in the 'POS' column is present in the intended sites list
+## We create a new dataframe that contains only variants at the specified genomic position
+intended_sites = [36937210, 36996899, 85400441, 85776687, 85918029, 86198668, 86236802, 86658391, 87049235]
+
+intended_mutations_df = df[df['POS'].isin(intended_sites)]
+intended_mutations_df
+
+## bar chart showing intended mutations on chromosome 2
+import matplotlib.pyplot as plt
+
+plt.hist(intended_mutations_df['POS'], bins=50, color='lightblue')
+plt.xlabel('Genomic Position')
+plt.ylabel('Mutation Frequency')
+plt.title('Chr 2 Distribution of Intended Mutations')
+
+In CRISPR-based genome editing, off-target effects occur when the Cas9 enzyme cuts the DNA at unintended sites, which are similar but not identical to the target sequence, which is what the table below shows.
+
+
+# Detecting off-target effects
+## using ~df, we are inverting the filter logic to include rows where 'POS' is not in the intended_sites list
+## Our resulting DF contains only variants at unintended (off-target) sites
+off_target_mutations_df = filtered_df[~filtered_df['POS'].isin(intended_sites)]
+off_target_mutations_df
+
+# Summarizing off-target mutations
+## We are grouping the data by chr column, but we are focusing the aggregate command on the 'POS' column
+## We are using .agg to for both "count": the number of occurrences of 'POS' within each chromosome group & "nunique": count the number of unique positions, POS, for each chromosome
+summary_df = off_target_mutations_df.groupby('CHROM')['POS'].agg(['count', 'nunique'])
+summary_df.columns = ['Mutation Count', 'Genotype Count']
+summary_df
+
+## We create a bar graph to show the distribution of off-target mutations using the data from the previous cell
+## Using this bar graph, we can see the distribution of off-target mutations in chromosome 2
+import matplotlib.pyplot as plt
+
+plt.hist(off_target_mutations_df['POS'], bins=50, color='lightpink')
+plt.xlabel('Genomic Position')
+plt.ylabel('Mutation Frequency')
+plt.title('Chr 2 Distribution of Off-Target Mutations')
+plt.show()
+
+## We filter the DataFrame to select rows where the 'POS' is not in the list of intended_sites, which identifies off-target mutations
+off_target_mutations_df = filtered_df[~filtered_df['POS'].isin(intended_sites)]
+off_target_mutations_df
+
+The table below is showing the mutation count vs the genotype in regards to chromosome 2 of the mouse.
+
+## We are grouping by 'CHROM', then aggregating the mutation_count data for each chromosome group
+## We use genotype_counts to calculate the count of each unique genotype
+off_target_summary_df = off_target_mutations_df.groupby('CHROM').agg(mutation_count=('POS', 'count'), genotype_counts=('GENOTYPE', 'value_counts'))
+
+off_target_summary_df
